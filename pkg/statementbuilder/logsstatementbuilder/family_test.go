@@ -137,6 +137,61 @@ func TestStatementBuilderResolvesLogFamilyFilteredAggregation(t *testing.T) {
 	}
 }
 
+// A rateIf aggregation resolves the family in its predicate and renders
+// countIf divided by the interval.
+func TestStatementBuilderResolvesLogFamilyRateIfAggregation(t *testing.T) {
+	releaseTime := time.Date(2024, 1, 15, 10, 0, 0, 0, time.UTC)
+	releaseTimeNano := uint64(releaseTime.UnixNano())
+
+	testCases := []struct {
+		name     string
+		familyOn bool
+		expected string
+	}{
+		{name: "FamiliesOn", familyOn: true, expected: "SELECT toStartOfInterval(fromUnixTimestamp64Nano(timestamp), INTERVAL 30 SECOND) AS ts, countIf((COALESCE(NULLIF(multiIf(resource.`deployment.environment.name` IS NOT NULL, resource.`deployment.environment.name`::String, mapContains(resources_string, 'deployment.environment.name'), resources_string['deployment.environment.name'], NULL), ''), NULLIF(multiIf(resource.`deployment.environment` IS NOT NULL, resource.`deployment.environment`::String, mapContains(resources_string, 'deployment.environment'), resources_string['deployment.environment'], NULL), ''), '') = ? AND (multiIf(resource.`deployment.environment.name` IS NOT NULL, resource.`deployment.environment.name`::String, mapContains(resources_string, 'deployment.environment.name'), resources_string['deployment.environment.name'], NULL) IS NOT NULL OR multiIf(resource.`deployment.environment` IS NOT NULL, resource.`deployment.environment`::String, mapContains(resources_string, 'deployment.environment'), resources_string['deployment.environment'], NULL) IS NOT NULL)))/30 AS __result_0 FROM signoz_logs.distributed_logs_v2 WHERE timestamp >= ? AND ts_bucket_start >= ? AND timestamp < ? AND ts_bucket_start <= ? GROUP BY ts"},
+		{name: "FamiliesOff", familyOn: false, expected: "SELECT toStartOfInterval(fromUnixTimestamp64Nano(timestamp), INTERVAL 30 SECOND) AS ts, countIf(multiIf(resource.`deployment.environment.name` IS NOT NULL, resource.`deployment.environment.name`::String, mapContains(resources_string, 'deployment.environment.name'), resources_string['deployment.environment.name'], NULL) = ?)/30 AS __result_0 FROM signoz_logs.distributed_logs_v2 WHERE timestamp >= ? AND ts_bucket_start >= ? AND timestamp < ? AND ts_bucket_start <= ? GROUP BY ts"},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			fl := flaggertest.WithBooleanFlags(t, map[string]bool{
+				flagger.FeatureResolveSemconvFamilies.String(): testCase.familyOn,
+			})
+			mockMetadataStore := telemetrytypestest.NewMockMetadataStore()
+			keys := logstelemetryschema.BuildCompleteFieldKeyMap(releaseTime)
+			for _, name := range []string{"deployment.environment.name", "deployment.environment"} {
+				keys[name] = []*telemetrytypes.TelemetryFieldKey{{
+					Name:          name,
+					Signal:        telemetrytypes.SignalLogs,
+					FieldContext:  telemetrytypes.FieldContextResource,
+					FieldDataType: telemetrytypes.FieldDataTypeString,
+				}}
+			}
+			mockMetadataStore.KeysMap = keys
+			storage := logstelemetryschema.NewStorage()
+			aggExprRewriter := querybuilder.NewAggExprRewriter(instrumentationtest.New().ToProviderSettings(), nil, storage, fl, telemetrytypes.SignalLogs)
+			statementBuilder := NewLogQueryStatementBuilder(
+				instrumentationtest.New().ToProviderSettings(),
+				mockMetadataStore, storage, aggExprRewriter,
+				logstelemetryschema.DefaultFullTextColumn, fl, nil,
+				statementbuilder.Config{SkipResourceFingerprint: statementbuilder.SkipResourceFingerprint{Enabled: false, Threshold: 100000}},
+			)
+
+			query := qbtypes.QueryBuilderQuery[qbtypes.LogAggregation]{
+				Signal:       telemetrytypes.SignalLogs,
+				StepInterval: qbtypes.Step{Duration: 30 * time.Second},
+				Aggregations: []qbtypes.LogAggregation{{Expression: "rateIf(deployment.environment.name = 'production')"}},
+			}
+			q, err := statementBuilder.Build(context.Background(), valuer.UUID{},
+				releaseTimeNano+uint64(24*time.Hour.Nanoseconds()),
+				releaseTimeNano+uint64(48*time.Hour.Nanoseconds()),
+				qbtypes.RequestTypeTimeSeries, query, nil)
+			require.NoError(t, err)
+			require.Equal(t, testCase.expected, q.Query)
+		})
+	}
+}
+
 // The mid-migration state: metadata holds one spelling of the family, and
 // the query names the other. The filter and the group by both read the one
 // stored spelling.

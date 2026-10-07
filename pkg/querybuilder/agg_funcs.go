@@ -205,7 +205,7 @@ var (
 	}
 	AggrFuncRateIf = AggrFunc{
 		Name:        valuer.NewString("rateif"),
-		FuncName:    "count",
+		FuncName:    "countIf",
 		Aliases:     []valuer.String{valuer.NewString("rate_if")},
 		RequireArgs: true, Rate: true, FuncCombinator: true, MinArgs: 1, MaxArgs: 1,
 	}
